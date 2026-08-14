@@ -1,4 +1,4 @@
-# lab1 MapReduce
+# go init
 1.vscode 的go拓展有一部分插件无法下载
 更改代理为国内代理，手动使用go install命令下载对应插件，然后重启vscode即可
 gopls安装验证：
@@ -27,3 +27,9 @@ source ~/.bashrc
 我没有做安装验证，直接重启vscode后拓展提示的staticcheck缺失的消息就不见了，静态检查可用。
 另外我在安装了gopls后重启了一次vscode然后再安装staticcheck然后再次重启vscode，没有尝试这两个插件能否一起安装。
 
+# lab1
++ map任务生成的中间文件需要使用json格式编码，不能和reduce的输出一样使用%v格式。json解析高效无歧义，%v格式打印后全都是字符串，难以解决key/value中含有空格、换行的情况。
++ 注意rpc的结构体定义规范，变量首字母要大写
++ worker实现无限循环获取任务，直到done之后结束
++ 无限循环中文件操作的defer close会循环结束后执行；手动close或使用匿名函数
++ job count test会生成误导文件，需要使用正则匹配剔除
