@@ -49,6 +49,7 @@ func Worker(mapf func(string, string) []KeyValue,
 			log.Fatal("call GetTask failed!")
 		}
 		// fmt.Printf("Worker received task: %v\n", reply)
+		timeStr := time.Now().Format("-01-02_15-04-05")
 		switch reply.TaskType {
 		case "map":
 			func() {
@@ -62,7 +63,7 @@ func Worker(mapf func(string, string) []KeyValue,
 				// create output files for each reduce task
 				files := make([]*os.File, reply.NReduce)
 				for i := 0; i < reply.NReduce; i++ {
-					file, err := os.Create(fmt.Sprintf("mr-%d-%d", reply.TaskId, i))
+					file, err := os.Create(fmt.Sprintf("mr-%d-%d"+timeStr, reply.TaskId, i))
 					if err != nil {
 						log.Fatalf("cannot create output file for reduce task %d", i)
 					}
@@ -76,6 +77,15 @@ func Worker(mapf func(string, string) []KeyValue,
 					// fmt.Printf("Map task %d writing key %s to bucket %d\n", reply.TaskId, kv.Key, bucket)
 					if err != nil {
 						log.Fatalf("cannot write to output file for reduce task %d", bucket)
+					}
+				}
+				// rename files to remove the timestamp suffix
+				for i := 0; i < reply.NReduce; i++ {
+					oldName := fmt.Sprintf("mr-%d-%d"+timeStr, reply.TaskId, i)
+					newName := fmt.Sprintf("mr-%d-%d", reply.TaskId, i)
+					err := os.Rename(oldName, newName)
+					if err != nil {
+						log.Fatalf("cannot rename file %s to %s", oldName, newName)
 					}
 				}
 				argsFinish := FinishTaskArgs{
@@ -124,7 +134,7 @@ func Worker(mapf func(string, string) []KeyValue,
 					}
 				}
 				sort.Sort(ByKey(MapResults))
-				oname := fmt.Sprintf("mr-out-%d", reply.TaskId)
+				oname := fmt.Sprintf("mr-out-%d"+timeStr, reply.TaskId)
 				// fmt.Printf("Reduce task %d writing output to %s\n", reply.TaskId, oname)
 				ofile, err := os.Create(oname)
 				if err != nil {
@@ -144,6 +154,13 @@ func Worker(mapf func(string, string) []KeyValue,
 					output := reducef(MapResults[i].Key, values)
 					fmt.Fprintf(ofile, "%v %v\n", MapResults[i].Key, output)
 					i = j
+				}
+				// rename the output file to remove the timestamp suffix
+				oldName := fmt.Sprintf("mr-out-%d"+timeStr, reply.TaskId)
+				newName := fmt.Sprintf("mr-out-%d", reply.TaskId)
+				err = os.Rename(oldName, newName)
+				if err != nil {
+					log.Fatalf("cannot rename file %s to %s", oldName, newName)
 				}
 				argsFinish := FinishTaskArgs{
 					TaskType: "reduce",

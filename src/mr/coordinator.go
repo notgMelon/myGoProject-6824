@@ -10,16 +10,28 @@ import (
 	"sync"
 )
 
+type MapTask struct {
+	FileName string
+	TaskId   int
+	done     bool
+}
+
+type ReduceTask struct {
+	TaskId int
+	done   bool
+}
+
 type Coordinator struct {
 	// Your definitions here.
 	mu                  sync.Mutex
 	nReduce             int
 	FinishedMapTasks    int
 	FinishedReduceTasks int
-	RunningMapTasks     []string
-	LeftMapTasks        []string
-	RunningReduceTasks  []int
-	LeftReduceTasks     []int
+
+	RunningMapTasks    map[int]chan struct{}
+	MapTasks           []MapTask
+	RunningReduceTasks map[int]chan struct{}
+	ReduceTasks        []ReduceTask
 }
 
 // Your code here -- RPC handlers for the worker to call.
@@ -52,7 +64,7 @@ func (c *Coordinator) Done() bool {
 	ret := false
 
 	// Your code here.
-	if len(c.LeftMapTasks) == 0 && len(c.RunningMapTasks) == 0 && len(c.LeftReduceTasks) == 0 && len(c.RunningReduceTasks) == 0 {
+	if c.FinishedMapTasks == len(c.MapTasks) && c.FinishedReduceTasks == len(c.ReduceTasks) {
 		ret = true
 	}
 	return ret
@@ -65,16 +77,18 @@ func MakeCoordinator(files []string, nReduce int) *Coordinator {
 	c := Coordinator{}
 
 	// Your code here.
-	c.LeftMapTasks = append([]string(nil), files...)
+	for i, file := range files {
+		c.MapTasks = append(c.MapTasks, MapTask{FileName: file, TaskId: i})
+	}
 	c.nReduce = nReduce
-	c.RunningMapTasks = []string{}
-	c.LeftReduceTasks = make([]int, nReduce)
+	c.RunningMapTasks = make(map[int]chan struct{})
+	c.ReduceTasks = make([]ReduceTask, nReduce)
 	for i := 0; i < nReduce; i++ {
-		c.LeftReduceTasks[i] = i
+		c.ReduceTasks[i] = ReduceTask{TaskId: i}
 	}
 	// fmt.Printf("Created %d map tasks\n", len(c.LeftMapTasks))
 	// fmt.Printf("Created %d reduce tasks\n", len(c.LeftReduceTasks))
-	c.RunningReduceTasks = []int{}
+	c.RunningReduceTasks = make(map[int]chan struct{})
 	c.server()
 	return &c
 }
