@@ -48,15 +48,26 @@ func (lk *Lock) Acquire() {
 					lk.state.owned = true
 					return
 				}
+				if err == rpc.ErrMaybe {
+					// The Put may have succeeded, but the response was lost.
+					// We don't know if we own the lock or not, so we have to
+					// check again.
+					continue
+				}
 			case lk.state.myID:
 				lk.state.owned = true
 				return
+			default:
+				// Someone else owns the lock.  Wait and try again.
 			}
 		case rpc.ErrNoKey:
 			err := lk.ck.Put(lk.state.name, lk.state.myID, 0)
 			if err == rpc.OK {
 				lk.state.owned = true
 				return
+			}
+			if err == rpc.ErrMaybe {
+				continue
 			}
 		}
 		time.Sleep(100 * time.Millisecond)
@@ -73,12 +84,16 @@ func (lk *Lock) Release() {
 		switch err {
 		case rpc.OK:
 			if owner == lk.state.myID {
-				for {
-					err := lk.ck.Put(lk.state.name, "", version)
-					if err == rpc.OK {
-						lk.state.owned = false
-						return
-					}
+				err := lk.ck.Put(lk.state.name, "", version)
+				if err == rpc.OK {
+					lk.state.owned = false
+					return
+				}
+				if err == rpc.ErrMaybe {
+					// The Put may have succeeded, but the response was lost.
+					// We don't know if we still own the lock or not, so we have to
+					// check again.
+					break
 				}
 			}
 			lk.state.owned = false
@@ -86,6 +101,8 @@ func (lk *Lock) Release() {
 		case rpc.ErrNoKey:
 			lk.state.owned = false
 			return
+		default:
+			// Some other error occurred.  Wait and try again.
 		}
 		time.Sleep(100 * time.Millisecond)
 	}

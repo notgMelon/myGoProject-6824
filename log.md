@@ -40,3 +40,4 @@ source ~/.bashrc
 # lab2
 ## tips
 + clerk的call的返回值表示是否收到reply
++ 注意6.5840课程的源码、测试方式每年可能有差异，如26年使用make测试，本项目参照的是25年的课程，使用go test测试。
