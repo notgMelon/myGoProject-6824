@@ -36,3 +36,7 @@ source ~/.bashrc
 + job count test会生成误导文件，需要使用正则匹配剔除
 ## tips
 + 用switch case同时监听多个channel，并处理最先收到信息的channel
+
+# lab2
+## tips
++ clerk的call的返回值表示是否收到reply
