@@ -35,9 +35,21 @@ source ~/.bashrc
 + 无限循环中文件操作的defer close会循环结束后执行；手动close或使用匿名函数
 + job count test会生成误导文件，需要使用正则匹配剔除
 ## tips
-+ 用switch case同时监听多个channel，并处理最先收到信息的channel
++ 用select case同时监听多个channel，并处理最先收到信息的channel
 
 # lab2
 ## tips
 + clerk的call的返回值表示是否收到reply
 + 注意6.5840课程的源码、测试方式每年可能有差异，如26年使用make测试，本项目参照的是25年的课程，使用go test测试。
+
+# lab3
+## 遇到的坑
++ 仔细查看论文fig 2以透彻理解server在各个状态下的行动逻辑
+    + follower变成candidate后立即递增term，不论是否当选；每次启动选举都会递增
+    + candidate没有当选应该回退为follower(可以给其他人投票)
+    + follower给其他人投票、收到leader rpc都会重置计时器
+    + rpc请求超时时间很长，广播**不能**等到全部人都回复后才继续处理
+    + 每个服务器每个term一票，不能多投
+## tips
++ ~~ 使用waitgroup批量启动goroutine发送rpc,并等所有routine完成后继续工作 ~~ , 豆包误我TwT
++ 发心跳、拉票请求应该新启动go routine执行，不能阻塞定时器；超时的心跳、拉票应该忽略
