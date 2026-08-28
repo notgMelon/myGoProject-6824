@@ -44,12 +44,16 @@ source ~/.bashrc
 
 # lab3
 ## 遇到的坑
+### 3A
 + 仔细查看论文fig 2以透彻理解server在各个状态下的行动逻辑
     + follower变成candidate后立即递增term，不论是否当选；每次启动选举都会递增
     + candidate没有当选应该回退为follower(可以给其他人投票)
     + follower给其他人投票、收到leader rpc都会重置计时器
     + rpc请求超时时间很长，广播**不能**等到全部人都回复后才继续处理
     + 每个服务器每个term一票，不能多投
-## tips
+#### tips
 + ~~ 使用waitgroup批量启动goroutine发送rpc,并等所有routine完成后继续工作 ~~ , 豆包误我TwT
 + 发心跳、拉票请求应该新启动go routine执行，不能阻塞定时器；超时的心跳、拉票应该忽略
+### 3B
++ leader收到新log后可以立即发rpc,不需要等待上一个rpc
++ leader要对各follower分别计时维持心跳；rpc失败重试同样重置心跳计时器
