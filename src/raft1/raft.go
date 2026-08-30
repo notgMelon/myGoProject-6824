@@ -63,10 +63,14 @@ type Raft struct {
 	ElectionAbort chan struct{}
 	// 记录是否正在重试
 	retry []bool
+	// 通知channnel
+	notify []chan struct{}
 	// for leader to stop routine when demoted
-	ctx     context.Context
-	cancel  context.CancelFunc
-	trigger chan struct{}
+	ctx    context.Context
+	cancel context.CancelFunc
+	// closed by Kill() to stop long-running goroutines
+	killCh   chan struct{}
+	killOnce sync.Once
 
 	// apply channel
 	applyCh chan raftapi.ApplyMsg
@@ -188,6 +192,12 @@ func (rf *Raft) RequestVote(args *RequestVoteArgs, reply *RequestVoteReply) {
 		}
 	default:
 		// first new term candidate
+		rf.currentTerm = args.Term
+		if rf.state == Leader {
+			rf.state = Follower
+			rf.cancel()
+		}
+		rf.state = Follower
 		if args.LastLogTerm < rf.log[len(rf.log)-1].Term ||
 			(args.LastLogTerm == rf.log[len(rf.log)-1].Term && args.LastLogIndex < len(rf.log)-1) {
 			return
@@ -199,7 +209,6 @@ func (rf *Raft) RequestVote(args *RequestVoteArgs, reply *RequestVoteReply) {
 		default:
 		}
 		rf.votedFor = args.CandidateId
-		rf.currentTerm = args.Term
 		return
 	}
 }
@@ -228,10 +237,7 @@ func (rf *Raft) AppendEntries(args *AppendEntriesArgs, reply *AppendEntriesReply
 		return
 	}
 	if rf.state == Leader {
-		select {
-		case rf.trigger <- struct{}{}:
-		default:
-		}
+		rf.cancel()
 	}
 	rf.state = Follower
 	if args.Term > rf.currentTerm {
@@ -246,13 +252,24 @@ func (rf *Raft) AppendEntries(args *AppendEntriesArgs, reply *AppendEntriesReply
 	}
 	if args.PrevLogIndex >= len(rf.log) || rf.log[args.PrevLogIndex].Term != args.PrevLogTerm {
 		reply.Success = false
+		if args.PrevLogIndex < len(rf.log) && rf.log[args.PrevLogIndex].Term != args.PrevLogTerm {
+			rf.log = rf.log[:args.PrevLogIndex]
+		}
 		return
 	}
 	// append new entries
 	if len(args.Entries) > 0 {
-
-		rf.log = rf.log[:args.PrevLogIndex+1]
-		rf.log = append(rf.log, args.Entries...)
+		DPrintf("[AppendEntries] Server %d from %d: prevLogIndex=%d, self commitIndex=%d", rf.me, args.LeaderId, args.PrevLogIndex, rf.commitIndex)
+		if rf.commitIndex > args.PrevLogIndex {
+			if rf.commitIndex-args.PrevLogIndex < len(args.Entries) {
+				rf.log = rf.log[:rf.commitIndex+1]
+				entries := args.Entries[rf.commitIndex-args.PrevLogIndex:]
+				rf.log = append(rf.log, entries...)
+			}
+		} else {
+			rf.log = rf.log[:args.PrevLogIndex+1]
+			rf.log = append(rf.log, args.Entries...)
+		}
 	}
 	if args.LeaderCommit > rf.commitIndex {
 		rf.commitIndex = min(args.LeaderCommit, len(rf.log)-1)
@@ -341,77 +358,172 @@ func (rf *Raft) sendRequestVote(server int, args *RequestVoteArgs, reply *Reques
 
 // send AppendEntries RPC to a server. automatically retry if failed
 func (rf *Raft) sendAppendEntries(server int) {
-	reply := AppendEntriesReply{}
-	if rf.killed() {
-		return
-	}
-	select {
-	case <-rf.ctx.Done():
-		return
-	default:
-	}
 	rf.mu.Lock()
-	logs := make([]logEntry, len(rf.log[rf.nextIndex[server]:]))
-	copy(logs, rf.log[rf.nextIndex[server]:])
-	prevLogIndex := rf.nextIndex[server] - 1
-	prevLogTerm := rf.log[prevLogIndex].Term
-	LeaderCommit := rf.commitIndex
-	term := rf.currentTerm
+	workerTerm := rf.currentTerm
+	workerCtx := rf.ctx
+	workerCancel := rf.cancel
 	rf.mu.Unlock()
-	select {
-	case rf.tickers[server].rst <- struct{}{}:
-	default:
-	}
-	args := AppendEntriesArgs{
-		Term:         term,
-		LeaderId:     rf.me,
-		PrevLogIndex: prevLogIndex,
-		PrevLogTerm:  prevLogTerm,
-		Entries:      logs,
-		LeaderCommit: LeaderCommit,
-	}
-	ok := rf.peers[server].Call("Raft.AppendEntries", &args, &reply)
-	select {
-	case <-rf.ctx.Done():
-		return
-	default:
-	}
-	if ok {
-		success := reply.Success
-		severTerm := reply.Term
-		switch success {
-		case true:
-			rf.mu.Lock()
-			rf.nextIndex[server] = len(rf.log)
-			rf.matchIndex[server] = len(rf.log) - 1
-			rf.retry[server] = false
+	for rf.killed() == false {
+		rf.mu.Lock()
+		isRetry := rf.retry[server]
+		if rf.currentTerm != workerTerm {
 			rf.mu.Unlock()
 			return
-		case false:
-			if severTerm > term {
-				rf.mu.Lock()
-				rf.currentTerm = severTerm
-				rf.votedFor = -1
-				rf.state = Follower
-				select {
-				case rf.trigger <- struct{}{}:
-				default:
-				}
-				rf.mu.Unlock()
-				DPrintf("[demote] Server %d: term %d\n", rf.me, severTerm)
+		}
+		if rf.state != Leader {
+			rf.mu.Unlock()
+			workerCancel()
+			return
+		}
+		rf.mu.Unlock()
+		select {
+		case <-workerCtx.Done():
+			return
+		default:
+		}
+		if !isRetry {
+			//等待通知
+			select {
+			case <-rf.notify[server]:
+			case <-workerCtx.Done():
+				return
+			case <-rf.killCh:
 				return
 			}
+			DPrintf("[sendAppendEntries] Server %d to %d\n", rf.me, server)
+		} else {
+			// 将要重试，清空notify channel
+			select {
+			case <-rf.notify[server]:
+			default:
+			}
+		}
+		select {
+		case <-workerCtx.Done():
+			return
+		default:
+		}
+		rf.mu.Lock()
+		// 检查term是否发生变化
+		if rf.currentTerm != workerTerm {
+			rf.mu.Unlock()
+			return
+		}
+		if rf.nextIndex[server] > len(rf.log) {
+			// illegal state, reset nextIndex
+			rf.nextIndex[server] = len(rf.log)
+		}
+		logs := make([]logEntry, len(rf.log[rf.nextIndex[server]:]))
+		copy(logs, rf.log[rf.nextIndex[server]:])
+		prevLogIndex := rf.nextIndex[server] - 1
+		prevLogTerm := rf.log[prevLogIndex].Term
+		LeaderCommit := rf.commitIndex
+		term := rf.currentTerm
+		state := rf.state
+		rf.mu.Unlock()
+		if state != Leader {
+			workerCancel()
+			return
+		}
+		if isRetry {
+			// 只在重试时重置计时器
+			select {
+			case rf.tickers[server].rst <- struct{}{}:
+			default:
+			}
+		}
+		args := AppendEntriesArgs{
+			Term:         term,
+			LeaderId:     rf.me,
+			PrevLogIndex: prevLogIndex,
+			PrevLogTerm:  prevLogTerm,
+			Entries:      logs,
+			LeaderCommit: LeaderCommit,
+		}
+		// send with a timeout: labrpc Call to an unreachable/disabled peer
+		// can block up to LONGDELAY (7s). Don't let it stall this sender,
+		// otherwise a reconnected peer can't be reached in time.
+		type aeResult struct {
+			ok    bool
+			reply AppendEntriesReply
+		}
+		ch := make(chan aeResult, 1)
+		go func() {
+			reply := AppendEntriesReply{}
+			ok := rf.peers[server].Call("Raft.AppendEntries", &args, &reply)
+			ch <- aeResult{ok, reply}
+		}()
+		var ok bool
+		var reply AppendEntriesReply
+		select {
+		case res := <-ch:
+			ok, reply = res.ok, res.reply
+		case <-time.After(100 * time.Millisecond):
+			ok = false
+		case <-workerCtx.Done():
+			return
+		case <-rf.killCh:
+			return
+		}
+		if ok {
+			// DPrintf("[AppendEntries] Server %d to %d: success=%v, term=%d\n", rf.me, server, reply.Success, reply.Term)
+			success := reply.Success
+			severTerm := reply.Term
+			switch success {
+			case true:
+				rf.mu.Lock()
+				if rf.state != Leader {
+					rf.mu.Unlock()
+					workerCancel()
+					return
+				}
+				if rf.currentTerm != term {
+					rf.mu.Unlock()
+					return
+				}
+				rf.nextIndex[server] = max(rf.nextIndex[server], prevLogIndex+len(logs)+1)
+				rf.matchIndex[server] = rf.nextIndex[server] - 1
+				rf.retry[server] = false
+				rf.mu.Unlock()
+			case false:
+				if severTerm > term {
+					rf.mu.Lock()
+					if rf.currentTerm == term && rf.state == Leader {
+						rf.currentTerm = severTerm
+						rf.votedFor = -1
+						rf.state = Follower
+						workerCancel()
+						rf.mu.Unlock()
+						// DPrintf("[demote] Server %d: term %d\n", rf.me, severTerm)
+						return
+					}
+					// 超期worker，直接返回
+					rf.mu.Unlock()
+					// DPrintf("[demote] Server %d: term %d\n", rf.me, severTerm)
+					return
+				}
+				rf.mu.Lock()
+				//TODO: better decrement way
+				rf.nextIndex[server] = prevLogIndex
+				rf.retry[server] = true
+				rf.mu.Unlock()
+			}
+		} else {
+			//retry
 			rf.mu.Lock()
-			//TODO: better decrement way
-			rf.nextIndex[server]--
+			rf.retry[server] = true
+			if rf.state != Leader {
+				workerCancel()
+				rf.mu.Unlock()
+				return
+			}
+			if rf.currentTerm != term {
+				rf.mu.Unlock()
+				return
+			}
 			rf.mu.Unlock()
 		}
 	}
-	//retry
-	rf.mu.Lock()
-	rf.retry[server] = true
-	rf.mu.Unlock()
-	go rf.sendAppendEntries(server)
 }
 
 // Start() call boardcastLogEntries() to send new log entries to all followers
@@ -419,8 +531,8 @@ func (rf *Raft) sendAppendEntries(server int) {
 func (rf *Raft) boardcastLogEntries() {
 	rf.mu.Lock()
 	if rf.state != Leader {
-		rf.mu.Unlock()
 		rf.cancel()
+		rf.mu.Unlock()
 		return
 	}
 	rf.mu.Unlock()
@@ -434,11 +546,16 @@ func (rf *Raft) boardcastLogEntries() {
 			return
 		default:
 		}
-		if rf.retry[i] {
-			//正在重试的server不需要新开goroutine
-			continue
+		rf.mu.Lock()
+		select {
+		case rf.notify[i] <- struct{}{}:
+		default:
 		}
-		go rf.sendAppendEntries(i)
+		select {
+		case rf.tickers[i].rst <- struct{}{}:
+		default:
+		}
+		rf.mu.Unlock()
 	}
 }
 
@@ -491,6 +608,9 @@ func (rf *Raft) Start(command interface{}) (int, int, bool) {
 // should call killed() to check whether it should stop.
 func (rf *Raft) Kill() {
 	atomic.StoreInt32(&rf.dead, 1)
+	rf.killOnce.Do(func() {
+		close(rf.killCh)
+	})
 	// Your code here, if desired.
 }
 
@@ -538,6 +658,7 @@ func (rf *Raft) StartElection(abortElectionChan chan struct{}) {
 	rf.currentTerm++
 	rf.votedFor = rf.me
 	rf.state = Candidate
+	ElectionTerm := rf.currentTerm
 	rf.mu.Unlock()
 	// fmt.Printf("Server %d starting election for term %d\n", rf.me, rf.currentTerm)
 	abortChan := make(chan struct{})
@@ -549,8 +670,17 @@ func (rf *Raft) StartElection(abortElectionChan chan struct{}) {
 		go rf.GetVote(i, replyChan, abortChan)
 	}
 	voteCount := 1
-OUTER:
 	for i := 0; i < len(rf.peers)-1; i++ {
+		// 检查存活
+		if rf.killed() {
+			return
+		}
+		rf.mu.Lock()
+		if ElectionTerm != rf.currentTerm {
+			rf.mu.Unlock()
+			return
+		}
+		rf.mu.Unlock()
 		select {
 		case reply := <-replyChan:
 			rf.mu.Lock()
@@ -559,17 +689,52 @@ OUTER:
 				rf.votedFor = -1
 				rf.state = Follower
 				rf.mu.Unlock()
-				DPrintf("[demote] Server %d: term %d\n", rf.me, rf.currentTerm)
+				// DPrintf("[demote] Server %d: term %d\n", rf.me, rf.currentTerm)
 				close(abortChan)
-				break OUTER
+				return
 			} else if reply.VoteGranted {
 				voteCount++
 				if voteCount >= len(rf.peers)/2+1 {
 					rf.state = Leader
-					rf.mu.Unlock()
+					// 排空abortElectionChan
 					close(abortChan)
+					select {
+					case <-abortElectionChan:
+					default:
+					}
+					// 重置ticker
+					select {
+					case rf.tickers[rf.me].rst <- struct{}{}:
+					default:
+					}
+					// get new ctx
+					ctx, cancel := context.WithCancel(context.Background())
+					rf.ctx = ctx
+					rf.cancel = cancel
+					// init nextIndex and matchIndex
+					rf.nextIndex = make([]int, len(rf.peers))
+					rf.matchIndex = make([]int, len(rf.peers))
+					for i := 0; i < len(rf.peers); i++ {
+						if i == rf.me {
+							continue
+						}
+						select {
+						case <-rf.ctx.Done():
+							return
+						default:
+						}
+						rf.nextIndex[i] = len(rf.log)
+						rf.matchIndex[i] = 0
+						rf.retry[i] = false
+						go rf.sendAppendEntries(i)
+						select {
+						case <-rf.notify[i]:
+						default:
+						}
+					}
+					rf.mu.Unlock()
 					DPrintf("[ElectionWon] Server %d: term %d\n", rf.me, rf.currentTerm)
-					break OUTER
+					return
 				}
 			}
 			rf.mu.Unlock()
@@ -581,33 +746,10 @@ OUTER:
 			return
 		}
 	}
-	// broadcast heartbeat to all
 	rf.mu.Lock()
-	defer rf.mu.Unlock()
-	if rf.state == Leader {
-		// get new ctx
-		ctx, cancel := context.WithCancel(context.Background())
-		rf.ctx = ctx
-		rf.cancel = cancel
-		// init nextIndex and matchIndex
-		rf.nextIndex = make([]int, len(rf.peers))
-		rf.matchIndex = make([]int, len(rf.peers))
-		for i := 0; i < len(rf.peers); i++ {
-			if i == rf.me {
-				continue
-			}
-			select {
-			case <-abortElectionChan:
-				return
-			default:
-			}
-			rf.nextIndex[i] = len(rf.log)
-			rf.matchIndex[i] = 0
-			go rf.sendAppendEntries(i)
-		}
-	} else {
-		rf.state = Follower
-	}
+	rf.state = Follower
+	rf.mu.Unlock()
+	close(abortChan)
 }
 
 func (rf *Raft) ticker() {
@@ -681,12 +823,23 @@ func (rf *Raft) HeartbeatMaintain(sever int) {
 			}
 			ticker.timer.Reset(time.Duration(100) * time.Millisecond)
 		case <-ticker.timer.C:
+			if !ticker.timer.Stop() {
+				select {
+				case <-ticker.timer.C:
+				default:
+				}
+			}
+			ticker.timer.Reset(time.Duration(100) * time.Millisecond)
 			rf.mu.Lock()
 			state := rf.state
 			rf.mu.Unlock()
 			if state == Leader {
 				rf.applyLogEntries()
-				go rf.sendAppendEntries(sever)
+				DPrintf("sending hb to %d", sever)
+				select {
+				case rf.notify[sever] <- struct{}{}:
+				default:
+				}
 			}
 		}
 	}
@@ -722,7 +875,10 @@ func Make(peers []*labrpc.ClientEnd, me int,
 	rf.ElectionAbort = make(chan struct{}, 1)
 	rf.tickers = make([]*Ticker, len(peers))
 	rf.retry = make([]bool, len(peers))
-	rf.trigger = make(chan struct{}, 1)
+	rf.killCh = make(chan struct{})
+	for i := 0; i < len(peers); i++ {
+		rf.notify = append(rf.notify, make(chan struct{}, 1))
+	}
 
 	// start ticker goroutine to start elections
 	go rf.ticker()

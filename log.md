@@ -57,3 +57,6 @@ source ~/.bashrc
 ### 3B
 + leader收到新log后可以立即发rpc,不需要等待上一个rpc
 + leader要对各follower分别计时维持心跳；rpc失败重试同样重置心跳计时器
++ 同上，长超时的rpc不能阻塞心跳、log发送
++ *重要：*leader启动的对follower发rpc的goroutine等协程要在各回路检查是否越任期工作、已经卸任，避免出现僵尸协程。可能持久化运行的各协程，包括选举worker等非leader启动但同样限定工作任期的协程都需要检查。
+    + 这一类协程也需要快照工作状态相关的变量（state, term, ctx等等）
