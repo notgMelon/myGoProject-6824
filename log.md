@@ -45,6 +45,7 @@ source ~/.bashrc
 # lab3
 ## 遇到的坑
 ### 3A
++ 参照3C第一条
 + 仔细查看论文fig 2以透彻理解server在各个状态下的行动逻辑
     + follower变成candidate后立即递增term，不论是否当选；每次启动选举都会递增
     + candidate没有当选应该回退为follower(可以给其他人投票)
@@ -60,3 +61,5 @@ source ~/.bashrc
 + 同上，长超时的rpc不能阻塞心跳、log发送
 + *重要：*leader启动的对follower发rpc的goroutine等协程要在各回路检查是否越任期工作、已经卸任，避免出现僵尸协程。可能持久化运行的各协程，包括选举worker等非leader启动但同样限定工作任期的协程都需要检查。
     + 这一类协程也需要快照工作状态相关的变量（state, term, ctx等等）
+### 3C
++ *重要：*注意需要持久化存储的状态首字母需要大写，其中包括封装结构体内的成员变量，labgob序列化中必需首字母大写
