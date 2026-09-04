@@ -66,4 +66,12 @@ source ~/.bashrc
 + *重要：*注意需要持久化存储的状态首字母需要大写，其中包括封装结构体内的成员变量，labgob序列化中必需首字母大写
 + leader当选后,如果存在还没有提交的日志（已经多数派达成共识），可以通过提交一条 no‑op（空操作，属于自己任期）日志，间接把之前所有合法日志提交（顺便广播自己为leader）
 + *重要：*对于上层收到的 CommandValid ApplyMsg，测试框架要求 CommandIndex 严格按 1 递增，不能跳号，并且不接受no op为合法操作（操作不能为nil）。本项目选择不实现no op逻辑
-+ 参照论文Figure8,leader需要注意不能直接提交旧term的log，只能间接提交
++ 参照论文Figure 8,leader需要注意不能直接提交旧term的log，只能间接提交
+### 3D
++ 参照论文Figure 13来实现snapshot功能(注意不需要实现快照分片传输)
++ 上层调用snapshot函数后服务器本地更新快照，仅leader按需分发
++ 将snapshot对应最后一个索引的entry保留/设置为dummy entry可以方便更新快照后计算索引对应的Log切片下标，并且不需要考虑len(log)为0的情况，我认为这是比较优美的实现
++ 增加快照机制后代码中需要注意的边界条件：
+    + follower收到快照，更新log和snapshot后收到rpc，要访问rf.Log的情况
+    + follower收到的AppendEntries rpc的logs和已有snapshot重叠的情况
+    + server计算某个term first/last index时 term < rf.snapshotTerm 的情况
