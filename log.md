@@ -75,3 +75,4 @@ source ~/.bashrc
     + follower收到快照，更新log和snapshot后收到rpc，要访问rf.Log的情况
     + follower收到的AppendEntries rpc的logs和已有snapshot重叠的情况
     + server计算某个term first/last index时 term < rf.snapshotTerm 的情况
++ apply Entry/快照 时需要先释放锁再写入chan，这会带来时序性问题，注意重新获取锁后需要检查服务器状态。如apply Entry之后需要注意在此期间是否收到了新的快照。

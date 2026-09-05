@@ -409,6 +409,20 @@ func (rf *Raft) AppendEntries(args *AppendEntriesArgs, reply *AppendEntriesReply
 	// TODO: 3bcd
 }
 
+// send an ApplyMsg to the state machine, aborting if the raft is killed.
+// a killed server may be shut down and replaced (restarted) by the tester;
+// an ordinary blocking send could deliver a stale ApplyMsg after the
+// replacement, which the new instance's log chain does not yet contain,
+// causing the tester to report a spurious "apply out of order".
+func (rf *Raft) tryApply(msg raftapi.ApplyMsg) bool {
+	select {
+	case rf.applyCh <- msg:
+		return true
+	case <-rf.killCh:
+		return false
+	}
+}
+
 // check commitIndex and apply to state machine
 func (rf *Raft) applyLogEntries() {
 	for rf.killed() == false {
@@ -418,26 +432,30 @@ func (rf *Raft) applyLogEntries() {
 		case <-rf.notifyApply:
 			rf.mu.Lock()
 			if rf.SnapshotByte != nil && rf.lastApplied < rf.SnapshotIndex {
+				applySi := rf.SnapshotIndex
 				applymsg := raftapi.ApplyMsg{
 					CommandValid:  false,
 					SnapshotValid: true,
 					Snapshot:      rf.SnapshotByte,
 					SnapshotTerm:  rf.SnapshotTerm,
-					SnapshotIndex: rf.SnapshotIndex,
+					SnapshotIndex: applySi,
 				}
 				rf.mu.Unlock()
-				rf.applyCh <- applymsg
+				if !rf.tryApply(applymsg) {
+					return
+				}
 				rf.mu.Lock()
-				rf.lastApplied = rf.SnapshotIndex
+				rf.lastApplied = max(rf.lastApplied, applySi)
 			}
 			if rf.state != Leader {
 				// just check self
 				for rf.lastApplied < rf.commitIndex {
+					if rf.lastApplied < rf.SnapshotIndex {
+						// apply 命令释放锁区间收到了快照
+						// 直接跳过命令apply
+						continue
+					}
 					rf.lastApplied++
-					// if rf.Log[rf.lastApplied].Command == nil {
-					// 	continue
-					// }
-					// rf.applyIndex++
 					applyMsg := raftapi.ApplyMsg{
 						CommandValid: true,
 						Command:      rf.Log[rf.idxInLog(rf.lastApplied)].Command,
@@ -446,7 +464,9 @@ func (rf *Raft) applyLogEntries() {
 					}
 					rf.mu.Unlock()
 					DPrintf("[APPLY] server %d -> %v, %d", rf.me, applyMsg.Command, applyMsg.CommandIndex)
-					rf.applyCh <- applyMsg
+					if !rf.tryApply(applyMsg) {
+						return
+					}
 					rf.mu.Lock()
 				}
 			} else {
@@ -463,11 +483,12 @@ func (rf *Raft) applyLogEntries() {
 					}
 					rf.commitIndex = minMatchIndex
 					for rf.lastApplied < rf.commitIndex {
+						if rf.lastApplied < rf.SnapshotIndex {
+							// apply 命令释放锁区间收到了快照
+							// 直接跳过命令apply
+							continue
+						}
 						rf.lastApplied++
-						// if rf.Log[rf.lastApplied].Command == nil {
-						// 	continue
-						// }
-						// rf.applyIndex++
 						applyMsg := raftapi.ApplyMsg{
 							CommandValid: true,
 							Command:      rf.Log[rf.idxInLog(rf.lastApplied)].Command,
@@ -476,7 +497,9 @@ func (rf *Raft) applyLogEntries() {
 						}
 						rf.mu.Unlock()
 						DPrintf("[APPLY] server %d -> %v, %d", rf.me, applyMsg.Command, applyMsg.CommandIndex)
-						rf.applyCh <- applyMsg
+						if !rf.tryApply(applyMsg) {
+							return
+						}
 						rf.mu.Lock()
 					}
 				}
